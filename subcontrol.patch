@@ -1,0 +1,1238 @@
+diff --git a/libraries/AP_Motors/AP_Motors6DOF.cpp b/libraries/AP_Motors/AP_Motors6DOF.cpp
+index d024bab..3bfa3f0 100644
+--- a/libraries/AP_Motors/AP_Motors6DOF.cpp
++++ b/libraries/AP_Motors/AP_Motors6DOF.cpp
+@@ -15,6 +15,7 @@
+ 
+ /*
+  *       AP_Motors6DOF.cpp - ArduSub motors library
++ *       ★ Subcontrol 修改版: FRAME_CONFIG=CUSTOM 使用通用控制分配矩阵
+  */
+ 
+ #include <AP_BattMonitor/AP_BattMonitor.h>
+@@ -23,6 +24,51 @@
+ 
+ extern const AP_HAL::HAL& hal;
+ 
++// ============================================================================
++// ★ Subcontrol: 推进器配置参数宏
++// 为 THR_n_POSX, THR_n_DIRX 等参数生成 var_info 条目
++// ============================================================================
++#define THR_PARAM_DEFS(n, idx_base) \
++    /* @Param: THR_##n##_POSX */ \
++    /* @DisplayName: Thruster n Position X */ \
++    /* @Description: Thruster n mounting position X in NED frame (meters, forward+) */ \
++    /* @Range: -2.0 2.0 */ \
++    /* @Increment: 0.01 */ \
++    /* @User: Standard */ \
++    AP_GROUPINFO("THR_" #n "_POSX", idx_base+0, AP_Motors6DOF, _thr_pos_x[n-1], (n<=4 ? 0.30f : (n<=8 ? 0.25f : 0.0f))), \
++    /* @Param: THR_##n##_POSY */ \
++    AP_GROUPINFO("THR_" #n "_POSY", idx_base+1, AP_Motors6DOF, _thr_pos_y[n-1], (n==1||n==3||n==5||n==7 ? -0.25f : 0.25f)), \
++    /* @Param: THR_##n##_POSZ */ \
++    AP_GROUPINFO("THR_" #n "_POSZ", idx_base+2, AP_Motors6DOF, _thr_pos_z[n-1], 0.0f), \
++    /* @Param: THR_##n##_DIRX */ \
++    AP_GROUPINFO("THR_" #n "_DIRX", idx_base+3, AP_Motors6DOF, _thr_dir_x[n-1], (n<=4 ? 0.707f : 0.0f)), \
++    /* @Param: THR_##n##_DIRY */ \
++    AP_GROUPINFO("THR_" #n "_DIRY", idx_base+4, AP_Motors6DOF, _thr_dir_y[n-1], (n<=4 ? ((n==1||n==3) ? -0.707f : 0.707f) : 0.0f)), \
++    /* @Param: THR_##n##_DIRZ */ \
++    AP_GROUPINFO("THR_" #n "_DIRZ", idx_base+5, AP_Motors6DOF, _thr_dir_z[n-1], (n>=5 ? 1.0f : 0.0f)), \
++    /* @Param: THR_##n##_FMAX */ \
++    AP_GROUPINFO("THR_" #n "_FMAX", idx_base+6, AP_Motors6DOF, _thr_fmax[n-1], 50.0f), \
++    /* @Param: THR_##n##_FMIN */ \
++    AP_GROUPINFO("THR_" #n "_FMIN", idx_base+7, AP_Motors6DOF, _thr_fmin[n-1], -50.0f)
++
++// ★ Subcontrol: 每桨推力曲线指数参数 (按型号标定; 0=用全局 CA_THRUST_CURVE)
++// 不放进 THR_PARAM_DEFS (避免重排已有参数), 独立挂在索引 84-99
++#define THR_CURVE_DEFS(n, idx_base) \
++    /* @Param: THR_##n##_CURVE */ \
++    /* @DisplayName: Thrust n forward curve exponent */ \
++    /* @Description: Per-thruster forward thrust curve exponent γ. throttle=(|u|/Fmax)^(1/γ). 0=global CA_THRUST_CURVE. 2=sqrt (thrust∝rpm²). */ \
++    /* @Range: 0 5 */ \
++    /* @Increment: 0.1 */ \
++    /* @User: Calibration */ \
++    AP_GROUPINFO("THR_" #n "_CURVE", idx_base+0, AP_Motors6DOF, _thr_curve[n-1], 2.0f), \
++    /* @Param: THR_##n##_RCURVE */ \
++    /* @DisplayName: Thrust n reverse curve exponent */ \
++    /* @Description: Per-thruster reverse thrust curve exponent γ. 0=global CA_REVERSE_CURVE. */ \
++    /* @Range: 0 5 */ \
++    /* @Increment: 0.1 */ \
++    /* @User: Calibration */ \
++    AP_GROUPINFO("THR_" #n "_RCURVE", idx_base+1, AP_Motors6DOF, _thr_rev_curve[n-1], 2.0f)
++
+ // parameters for the motor class
+ const AP_Param::GroupInfo AP_Motors6DOF::var_info[] = {
+     AP_NESTEDGROUPINFO(AP_MotorsMulticopter, 0),
+@@ -118,6 +164,78 @@ const AP_Param::GroupInfo AP_Motors6DOF::var_info[] = {
+     // @User: Standard
+     AP_GROUPINFO("12_DIRECTION", 13, AP_Motors6DOF, _motor_reverse[11], 1),
+ 
++    // ========================================================================
++    // ★ Subcontrol: 推进器配置参数 (THR_n_*)
++    // 8 params per thruster × 8 thrusters = 64 params starting at index 14
++    // 默认值: 标准 4水平+4垂直 布局 (45°外八字)
++    // ========================================================================
++    THR_PARAM_DEFS(1, 14),   // idx 14-21
++    THR_PARAM_DEFS(2, 22),   // idx 22-29
++    THR_PARAM_DEFS(3, 30),   // idx 30-37
++    THR_PARAM_DEFS(4, 38),   // idx 38-45
++    THR_PARAM_DEFS(5, 46),   // idx 46-53
++    THR_PARAM_DEFS(6, 54),   // idx 54-61
++    THR_PARAM_DEFS(7, 62),   // idx 62-69
++    THR_PARAM_DEFS(8, 70),   // idx 70-77
++
++    // ★ Subcontrol: 每桨推力曲线指数 (按型号标定), 索引 84-99 (不重排已有参数)
++    THR_CURVE_DEFS(1, 84),   // idx 84-85
++    THR_CURVE_DEFS(2, 86),   // idx 86-87
++    THR_CURVE_DEFS(3, 88),   // idx 88-89
++    THR_CURVE_DEFS(4, 90),   // idx 90-91
++    THR_CURVE_DEFS(5, 92),   // idx 92-93
++    THR_CURVE_DEFS(6, 94),   // idx 94-95
++    THR_CURVE_DEFS(7, 96),   // idx 96-97
++    THR_CURVE_DEFS(8, 98),   // idx 98-99
++
++    // @Param: CA_N_THRUSTERS
++    // @DisplayName: Number of thrusters for control allocation
++    // @Description: Number of active thrusters when using CUSTOM frame. Only THR_1_* through THR_CA_N_THRUSTERS_* are used.
++    // @Range: 0 8
++    // @Increment: 1
++    // @User: Standard
++    AP_GROUPINFO("CA_N_THRUSTERS", 78, AP_Motors6DOF, _ca_n_thrusters, 8),
++
++    // @Param: CA_CG_X
++    // @DisplayName: Center of Gravity X offset
++    // @Description: CG position X in NED frame (meters, forward+). Affects torque calculation.
++    // @Range: -1.0 1.0
++    // @Increment: 0.01
++    // @User: Standard
++    AP_GROUPINFO("CA_CG_X", 79, AP_Motors6DOF, _ca_cg_x, 0.0f),
++
++    // @Param: CA_CG_Y
++    // @DisplayName: Center of Gravity Y offset
++    // @Description: CG position Y in NED frame (meters, right+). Affects torque calculation.
++    // @Range: -1.0 1.0
++    AP_GROUPINFO("CA_CG_Y", 80, AP_Motors6DOF, _ca_cg_y, 0.0f),
++
++    // @Param: CA_CG_Z
++    // @DisplayName: Center of Gravity Z offset
++    // @Description: CG position Z in NED frame (meters, down+). Affects torque calculation.
++    // @Range: -1.0 1.0
++    AP_GROUPINFO("CA_CG_Z", 81, AP_Motors6DOF, _ca_cg_z, 0.0f),
++
++    // @Param: CA_THRUST_CURVE
++    // @DisplayName: Thrust curve exponent (forward)
++    // @Description: Power-law exponent γ mapping thruster force to throttle:
++    //   throttle = sign(u)·(|u|/F_max)^(1/γ). Thruster thrust in water is ~∝RPM²,
++    //   so γ=2 (default) gives throttle = √(u/F_max), linearizing the thrust response.
++    //   Set γ=1 to disable (linear). Lower γ softens, higher γ sharpens low-end thrust.
++    // @Range: 0.5 5.0
++    // @Increment: 0.1
++    // @User: Calibration
++    AP_GROUPINFO("CA_THRUST_CURVE", 82, AP_Motors6DOF, _ca_thrust_curve, 2.0f),
++
++    // @Param: CA_REVERSE_CURVE
++    // @DisplayName: Thrust curve exponent (reverse)
++    // @Description: Same as CA_THRUST_CURVE but for reverse thrust. Set separately
++    //   if the propeller produces different thrust when running in reverse.
++    // @Range: 0.5 5.0
++    // @Increment: 0.1
++    // @User: Calibration
++    AP_GROUPINFO("CA_REVERSE_CURVE", 83, AP_Motors6DOF, _ca_reverse_curve, 2.0f),
++
+     AP_GROUPEND
+ };
+ 
+@@ -128,6 +246,8 @@ void AP_Motors6DOF::setup_motors(motor_frame_class frame_class, motor_frame_type
+         remove_motor(i);
+     }
+ 
++    _use_control_alloc = false;
++
+     // hard coded config for supported frames
+     switch ((sub_frame_t)frame_class) {
+         //                 Motor #              Roll Factor     Pitch Factor    Yaw Factor      Throttle Factor     Forward Factor      Lateral Factor  Testing Order
+@@ -176,8 +296,72 @@ void AP_Motors6DOF::setup_motors(motor_frame_class frame_class, motor_frame_type
+         break;
+ 
+     case SUB_FRAME_CUSTOM:
+-        // Put your custom motor setup here
+-        //break;
++        // ★ Subcontrol: 使用通用控制分配矩阵
++        _frame_class_string = "CUSTOM";
++        _use_control_alloc = true;
++        {
++            // 从参数读取推进器配置
++            uint8_t n = (uint8_t)_ca_n_thrusters;
++            if (n > AP_MOTORS_MAX_NUM_MOTORS) n = AP_MOTORS_MAX_NUM_MOTORS;
++            if (n == 0) n = 8; // 默认8推进器
++
++            ThrusterConfig thrusters[CA_MAX_THRUSTERS];
++            memset(thrusters, 0, sizeof(thrusters));
++
++            for (uint8_t i = 0; i < n; i++) {
++                // 推进器名称
++                hal.util->snprintf(thrusters[i].name, 32, "THR_%d", i+1);
++
++                // 安装位置 (NED, 米)
++                thrusters[i].position.x = _thr_pos_x[i];
++                thrusters[i].position.y = _thr_pos_y[i];
++                thrusters[i].position.z = _thr_pos_z[i];
++
++                // 推力方向 (单位向量, 内部自动归一化)
++                thrusters[i].direction.x = _thr_dir_x[i];
++                thrusters[i].direction.y = _thr_dir_y[i];
++                thrusters[i].direction.z = _thr_dir_z[i];
++
++                // 推力限制 (牛顿)
++                thrusters[i].max_force = _thr_fmax[i];
++                thrusters[i].min_force = _thr_fmin[i];
++
++                // 推力曲线指数 (按型号标定; 0=用全局 CA_THRUST_CURVE)
++                thrusters[i].thrust_curve = _thr_curve[i];
++                thrusters[i].reverse_curve = _thr_rev_curve[i];
++
++                // 方向标志 (从 _motor_reverse 读取已有参数)
++                thrusters[i].reverse = (_motor_reverse[i] < 0) ? 1 : 0;
++
++                // 分组
++                if (i < 4) {
++                    hal.util->snprintf(thrusters[i].group, 16, "horizontal");
++                } else {
++                    hal.util->snprintf(thrusters[i].group, 16, "vertical");
++                }
++            }
++
++            // CG 偏移
++            Vector3f cg(_ca_cg_x, _ca_cg_y, _ca_cg_z);
++
++            // 初始化控制分配矩阵 (构建 B 矩阵 + 计算伪逆)
++            _ca_matrix.init(thrusters, n, cg);
++
++            // 注册电机输出 (使用与传统模式相同的电机, 但分配由 _ca_matrix 控制)
++            for (uint8_t i = 0; i < n; i++) {
++                add_motor_raw(i, 1.0f, 1.0f, 1.0f, i+1);
++                _throttle_factor[i] = 0.0f;
++                _forward_factor[i] = 0.0f;
++                _lateral_factor[i] = 0.0f;
++            }
++
++            // 输出诊断信息
++            ControlAllocDiagnosis diag;
++            _ca_matrix.diagnose(diag);
++            hal.console->printf("ControlAlloc: %d thrusters, rank=%d/6, cond=%.1f, quality=%d/100\n",
++                n, diag.rank, (double)diag.condition_number, diag.quality_score);
++        }
++        break;
+ 
+     case SUB_FRAME_SIMPLEROV_3:
+         _frame_class_string = "SIMPLEROV_3";
+@@ -219,7 +403,6 @@ void AP_Motors6DOF::output_min()
+     limit.set_throttle(false);
+ 
+     // fill the motor_out[] array for HIL use and send minimum value to each motor
+-    // ToDo find a field to store the minimum pwm instead of hard coding 1500
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+             rc_write(i, 1500);
+@@ -242,7 +425,6 @@ void AP_Motors6DOF::output_to_motors()
+     switch (_spool_state) {
+     case SpoolState::SHUT_DOWN:
+         // sends minimum values out to the motors
+-        // set motor output based on thrust requests
+         for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+             if (motor_enabled[i]) {
+                 motor_out[i] = 1500;
+@@ -283,11 +465,14 @@ float AP_Motors6DOF::get_current_limit_max_throttle()
+ }
+ 
+ // output_armed - sends commands to the motors
+-// includes new scaling stability patch
+-// TODO pull code that is common to output_armed_not_stabilizing into helper functions
+-// ToDo calculate headroom for rpy to be added for stabilization during full throttle/forward/lateral commands
++// ★ Subcontrol: 添加 CUSTOM 帧分发
+ void AP_Motors6DOF::output_armed_stabilizing()
+ {
++    if (_use_control_alloc) {
++        output_armed_stabilizing_custom();
++        return;
++    }
++
+     if ((sub_frame_t)_active_frame_class == SUB_FRAME_VECTORED) {
+         output_armed_stabilizing_vectored();
+     } else if ((sub_frame_t)_active_frame_class == SUB_FRAME_VECTORED_6DOF) {
+@@ -308,8 +493,8 @@ void AP_Motors6DOF::output_armed_stabilizing()
+         forward_thrust = _forward_in;
+         lateral_thrust = _lateral_in;
+ 
+-        float rpy_out[AP_MOTORS_MAX_NUM_MOTORS]; // buffer so we don't have to multiply coefficients multiple times.
+-        float linear_out[AP_MOTORS_MAX_NUM_MOTORS]; // 3 linear DOF mix for each motor
++        float rpy_out[AP_MOTORS_MAX_NUM_MOTORS];
++        float linear_out[AP_MOTORS_MAX_NUM_MOTORS];
+ 
+         // initialize limits flags
+         limit.set_all(false);
+@@ -330,12 +515,10 @@ void AP_Motors6DOF::output_armed_stabilizing()
+                 rpy_out[i] = roll_thrust * _roll_factor[i] +
+                              pitch_thrust * _pitch_factor[i] +
+                              yaw_thrust * _yaw_factor[i];
+-
+             }
+         }
+ 
+         // calculate linear command for each motor
+-        // linear factors should be 0.0 or 1.0 for now
+         for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+             if (motor_enabled[i]) {
+                 linear_out[i] = throttle_thrust * _throttle_factor[i] +
+@@ -355,20 +538,15 @@ void AP_Motors6DOF::output_armed_stabilizing()
+ #if AP_BATTERY_ENABLED
+     const AP_BattMonitor &battery = AP::battery();
+ 
+-	// Current limiting
+     float _batt_current;
+     if (_batt_current_max <= 0.0f || !battery.current_amps(_batt_current)) {
+         return;
+     }
+ 
+     float _batt_current_delta = _batt_current - _batt_current_last;
+-
+     float _current_change_rate = _batt_current_delta / _dt_s;
+-
+     float predicted_current = _batt_current + (_current_change_rate * _dt_s * 5);
+-
+     float batt_current_ratio = _batt_current / _batt_current_max;
+-
+     float predicted_current_ratio = predicted_current / _batt_current_max;
+     _batt_current_last = _batt_current;
+ 
+@@ -389,19 +567,120 @@ void AP_Motors6DOF::output_armed_stabilizing()
+     }
+ }
+ 
+-// output_armed - sends commands to the motors
+-// includes new scaling stability patch
+-// TODO pull code that is common to output_armed_not_stabilizing into helper functions
+-// ToDo calculate headroom for rpy to be added for stabilization during full throttle/forward/lateral commands
++// ★ Subcontrol: 自定义控制分配输出
++// 使用通用的 Moore-Penrose 伪逆矩阵进行推力分配
++void AP_Motors6DOF::output_armed_stabilizing_custom()
++{
++    uint8_t n = _ca_matrix.get_num_thrusters();
++    if (n == 0) return;
++
++    // 从飞行控制器获取 6-DOF 期望力/力矩 (归一化到 -1..1)
++    // 映射到物理力/力矩: 乘以最大推力/力矩
++    float roll_thrust    = (_roll_in + _roll_in_ff);
++    float pitch_thrust   = (_pitch_in + _pitch_in_ff);
++    float yaw_thrust     = (_yaw_in + _yaw_in_ff);
++    float throttle_thrust = get_throttle_bidirectional();
++    float forward_thrust  = _forward_in;
++    float lateral_thrust  = _lateral_in;
++
++    // 限制油门范围
++    if (throttle_thrust <= -_throttle_thrust_max) {
++        throttle_thrust = -_throttle_thrust_max;
++        limit.throttle_lower = true;
++    }
++    if (throttle_thrust >= _throttle_thrust_max) {
++        throttle_thrust = _throttle_thrust_max;
++        limit.throttle_upper = true;
++    }
++
++    // 将归一化控制输入映射为 6-DOF 力/力矩向量 tau
++    // tau = [Fx, Fy, Fz, Mx, My, Mz]  (NED, N / N·m)
++    // 注意: 此处使用各推进器总能力的 1/2 作为最大期望值
++    const float max_force_per_axis  = 200.0f;   // 单轴最大推力 (N)
++    const float max_torque_per_axis = 50.0f;    // 单轴最大力矩 (N·m)
++
++    float tau[6];
++    tau[0] = forward_thrust  * max_force_per_axis;   // Fx (Surge)
++    tau[1] = lateral_thrust  * max_force_per_axis;   // Fy (Sway)
++    tau[2] = throttle_thrust * max_force_per_axis;   // Fz (Heave)
++    tau[3] = roll_thrust     * max_torque_per_axis;  // Mx (Roll)
++    tau[4] = pitch_thrust    * max_torque_per_axis;  // My (Pitch)
++    tau[5] = yaw_thrust      * max_torque_per_axis;  // Mz (Yaw)
++
++    // ★ 核心: 使用通用控制分配矩阵将 tau 分配到各推进器
++    // RPI 方法: 迭代处理饱和, 保持力矩方向
++    float u[CA_MAX_THRUSTERS];
++    _ca_matrix.allocate(tau, u, 1);  // method=1: RPI
++
++    // 将推力(牛顿)转换为油门(-1..1)，并用推力曲线反函数补偿非线性
++    //   throttle = sign(u)·(|u|/F_i_max)^(1/γ)
++    // 之前用固定 norm_factor=100 且纯线性映射，导致:
++    //   1) 与各推进器自身 F_MAX/F_MIN 无关 (布局不同就错乱)
++    //   2) 把非线性"转速→推力"当线性，实际推力 = F_max·油门² 被压软
++    // 现在除以该推进器自身在该方向的极限力，再按可调指数 γ 反解油门。
++    for (uint8_t i = 0; i < n; i++) {
++        // 该方向的最大推力幅值 (FMIN 为负值，取幅值)
++        float f_i = (u[i] >= 0.0f) ? _thr_fmax[i] : -_thr_fmin[i];
++        // 每桨推力曲线指数 (按型号标定); ≤0 则退回全局参数，再退 2.0
++        float gamma = (u[i] >= 0.0f) ? _thr_curve[i] : _thr_rev_curve[i];
++        if (gamma <= 0.0f) {
++            gamma = (u[i] >= 0.0f) ? _ca_thrust_curve : _ca_reverse_curve;
++        }
++        if (gamma <= 0.0f) {
++            gamma = 2.0f;
++        }
++
++        if (f_i <= 0.0f || gamma <= 0.0f || u[i] == 0.0f) {
++            _thrust_rpyt_out[i] = 0.0f;
++        } else {
++            float ratio = constrain_float(fabsf(u[i]) / f_i, 0.0f, 1.0f);
++            float throttle = powf(ratio, 1.0f / gamma);
++            _thrust_rpyt_out[i] = (u[i] > 0.0f) ? throttle : -throttle;
++        }
++    }
++
++    // 未使用的电机置零
++    for (uint8_t i = n; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
++        _thrust_rpyt_out[i] = 0.0f;
++    }
++
++    // 电流限制 (与原版相同)
++#if AP_BATTERY_ENABLED
++    const AP_BattMonitor &battery = AP::battery();
++    float _batt_current;
++    if (_batt_current_max > 0.0f && battery.current_amps(_batt_current)) {
++        float _batt_current_delta = _batt_current - _batt_current_last;
++        float _current_change_rate = _batt_current_delta / _dt_s;
++        float predicted_current = _batt_current + (_current_change_rate * _dt_s * 5);
++        float batt_current_ratio = _batt_current / _batt_current_max;
++        if (predicted_current > _batt_current_max * 1.5f) {
++            batt_current_ratio = 2.5f;
++        } else if (_batt_current < _batt_current_max && predicted_current > _batt_current_max) {
++            batt_current_ratio = predicted_current / _batt_current_max;
++        }
++        _batt_current_last = _batt_current;
++        _output_limited += (_dt_s / (_dt_s + _batt_current_time_constant)) * (1 - batt_current_ratio);
++    }
++#endif
++    _output_limited = constrain_float(_output_limited, 0.0f, 1.0f);
++
++    for (uint8_t i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
++        if (motor_enabled[i]) {
++            _thrust_rpyt_out[i] *= _output_limited;
++        }
++    }
++}
++
++// output_armed_stabilizing_vectored (原版保持不变)
+ void AP_Motors6DOF::output_armed_stabilizing_vectored()
+ {
+-    uint8_t i;                          // general purpose counter
+-    float   roll_thrust;                // roll thrust input value, +/- 1.0
+-    float   pitch_thrust;               // pitch thrust input value, +/- 1.0
+-    float   yaw_thrust;                 // yaw thrust input value, +/- 1.0
+-    float   throttle_thrust;            // throttle thrust input value, +/- 1.0
+-    float   forward_thrust;             // forward thrust input value, +/- 1.0
+-    float   lateral_thrust;             // lateral thrust input value, +/- 1.0
++    uint8_t i;
++    float   roll_thrust;
++    float   pitch_thrust;
++    float   yaw_thrust;
++    float   throttle_thrust;
++    float   forward_thrust;
++    float   lateral_thrust;
+ 
+     roll_thrust = (_roll_in + _roll_in_ff);
+     pitch_thrust = (_pitch_in + _pitch_in_ff);
+@@ -410,24 +689,20 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored()
+     forward_thrust = _forward_in;
+     lateral_thrust = _lateral_in;
+ 
+-    float rpy_out[AP_MOTORS_MAX_NUM_MOTORS]; // buffer so we don't have to multiply coefficients multiple times.
+-    float linear_out[AP_MOTORS_MAX_NUM_MOTORS]; // 3 linear DOF mix for each motor
++    float rpy_out[AP_MOTORS_MAX_NUM_MOTORS];
++    float linear_out[AP_MOTORS_MAX_NUM_MOTORS];
+ 
+-    // initialize limits flags
+     limit.set_all(false);
+ 
+-    // sanity check throttle is above zero and below current limited throttle
+     if (throttle_thrust <= -_throttle_thrust_max) {
+         throttle_thrust = -_throttle_thrust_max;
+         limit.throttle_lower = true;
+     }
+-
+     if (throttle_thrust >= _throttle_thrust_max) {
+         throttle_thrust = _throttle_thrust_max;
+         limit.throttle_upper = true;
+     }
+ 
+-    // calculate roll, pitch and yaw for each motor
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+             rpy_out[i] = roll_thrust * _roll_factor[i] +
+@@ -442,29 +717,20 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored()
+     }
+     int8_t forward_coupling_direction[] = {-1,-1,1,1,0,0,0,0,0,0,0,0};
+ 
+-    // calculate linear command for each motor
+-    // linear factors should be 0.0 or 1.0 for now
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+-
+             float forward_thrust_limited = forward_thrust;
+-
+-            // The following statements decouple forward/vertical hydrodynamic coupling on
+-            // vectored ROVs. This is done by limiting the maximum output of the "rear" vectored
+-            // thruster (where "rear" depends on direction of travel).
+             if (!is_zero(forward_thrust_limited)) {
+                 if ((forward_thrust < 0) == (forward_coupling_direction[i] < 0) && forward_coupling_direction[i] != 0) {
+                     forward_thrust_limited = constrain_float(forward_thrust, -forward_coupling_limit, forward_coupling_limit);
+                 }
+             }
+-
+             linear_out[i] = throttle_thrust * _throttle_factor[i] +
+                             forward_thrust_limited * _forward_factor[i] +
+                             lateral_thrust * _lateral_factor[i];
+         }
+     }
+ 
+-    // Calculate final output for each motor
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+             _thrust_rpyt_out[i] = constrain_float(_motor_reverse[i]*(rpy_out[i] + linear_out[i]), -1.0f, 1.0f);
+@@ -472,17 +738,16 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored()
+     }
+ }
+ 
+-// Band Aid fix for motor normalization issues.
+-// TODO: find a global solution for managing saturation that works for all vehicles
++// output_armed_stabilizing_vectored_6dof (原版保持不变)
+ void AP_Motors6DOF::output_armed_stabilizing_vectored_6dof()
+ {
+-    uint8_t i;                          // general purpose counter
+-    float   roll_thrust;                // roll thrust input value, +/- 1.0
+-    float   pitch_thrust;               // pitch thrust input value, +/- 1.0
+-    float   yaw_thrust;                 // yaw thrust input value, +/- 1.0
+-    float   throttle_thrust;            // throttle thrust input value, +/- 1.0
+-    float   forward_thrust;             // forward thrust input value, +/- 1.0
+-    float   lateral_thrust;             // lateral thrust input value, +/- 1.0
++    uint8_t i;
++    float   roll_thrust;
++    float   pitch_thrust;
++    float   yaw_thrust;
++    float   throttle_thrust;
++    float   forward_thrust;
++    float   lateral_thrust;
+ 
+     roll_thrust = (_roll_in + _roll_in_ff);
+     pitch_thrust = (_pitch_in + _pitch_in_ff);
+@@ -491,20 +756,17 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored_6dof()
+     forward_thrust = _forward_in;
+     lateral_thrust = _lateral_in;
+ 
+-    float rpt_out[AP_MOTORS_MAX_NUM_MOTORS]; // buffer so we don't have to multiply coefficients multiple times.
+-    float yfl_out[AP_MOTORS_MAX_NUM_MOTORS]; // 3 linear DOF mix for each motor
++    float rpt_out[AP_MOTORS_MAX_NUM_MOTORS];
++    float yfl_out[AP_MOTORS_MAX_NUM_MOTORS];
+     float rpt_max;
+     float yfl_max;
+ 
+-    // initialize limits flags
+     limit.set_all(false);
+ 
+-    // sanity check throttle is above zero and below current limited throttle
+     if (throttle_thrust <= -_throttle_thrust_max) {
+         throttle_thrust = -_throttle_thrust_max;
+         limit.throttle_lower = true;
+     }
+-
+     if (throttle_thrust >= _throttle_thrust_max) {
+         throttle_thrust = _throttle_thrust_max;
+         limit.throttle_upper = true;
+@@ -512,8 +774,7 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored_6dof()
+ 
+     throttle_thrust = constrain_float(throttle_thrust, -1.0f, _max_throttle);
+ 
+-    // calculate roll, pitch and Throttle for each motor (only used by vertical thrusters)
+-    rpt_max = 1; //Initialized to 1 so that normalization will only occur if value is saturated
++    rpt_max = 1;
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+             rpt_out[i] = roll_thrust * _roll_factor[i] +
+@@ -525,9 +786,7 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored_6dof()
+         }
+     }
+ 
+-    // calculate linear/yaw command for each motor (only used for translational thrusters)
+-    // linear factors should be 0.0 or 1.0 for now
+-    yfl_max = 1; //Initialized to 1 so that normalization will only occur if value is saturated
++    yfl_max = 1;
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+             yfl_out[i] = yaw_thrust * _yaw_factor[i] +
+@@ -539,7 +798,6 @@ void AP_Motors6DOF::output_armed_stabilizing_vectored_6dof()
+         }
+     }
+ 
+-    // Calculate final output for each motor and normalize if necessary
+     for (i=0; i<AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+             _thrust_rpyt_out[i] = constrain_float(_motor_reverse[i]*(rpt_out[i]/rpt_max + yfl_out[i]/yfl_max),-1.0f,1.0f);
+diff --git a/libraries/AP_Motors/AP_Motors6DOF.h b/libraries/AP_Motors/AP_Motors6DOF.h
+index 9ca0f97..6725277 100644
+--- a/libraries/AP_Motors/AP_Motors6DOF.h
++++ b/libraries/AP_Motors/AP_Motors6DOF.h
+@@ -1,5 +1,8 @@
+ /// @file	AP_Motors6DOF.h
+ /// @brief	Motor control class for ROVs with direct control over 6DOF (or fewer) in movement
++///
++/// ★ Subcontrol 修改版: 添加通用控制分配矩阵支持 (ControlAllocationMatrix)
++///   FRAME_CONFIG=CUSTOM 时使用 ControlAllocationMatrix 替代硬编码推进器映射
+ 
+ #pragma once
+ 
+@@ -7,6 +10,7 @@
+ #include <AP_Math/AP_Math.h>        // ArduPilot Mega Vector/Matrix math Library
+ #include <RC_Channel/RC_Channel.h>     // RC Channel Library
+ #include "AP_MotorsMatrix.h"
++#include "AP_Motors_ControlAlloc.h"   // ★ Subcontrol: 通用控制分配矩阵
+ 
+ /// @class      AP_MotorsMatrix
+ class AP_Motors6DOF : public AP_MotorsMatrix {
+@@ -51,6 +55,13 @@ public:
+ 
+     bool set_reversed(int motor_number, bool reversed);
+ 
++    // ★ Subcontrol: 获取控制分配诊断信息
++    bool get_control_alloc_diagnosis(ControlAllocDiagnosis &diag) {
++        if (!_use_control_alloc) return false;
++        _ca_matrix.diagnose(diag);
++        return true;
++    }
++
+     // var_info for holding Parameter information
+     static const struct AP_Param::GroupInfo        var_info[];
+ 
+@@ -64,6 +75,7 @@ protected:
+     void output_armed_stabilizing() override;
+     void output_armed_stabilizing_vectored();
+     void output_armed_stabilizing_vectored_6dof();
++    void output_armed_stabilizing_custom();  // ★ Subcontrol: 自定义控制分配输出
+ 
+     // Parameters
+     AP_Int8             _motor_reverse[AP_MOTORS_MAX_NUM_MOTORS];
+@@ -76,4 +88,40 @@ protected:
+     // current limiting
+     float _output_limited = 1.0f;
+     float _batt_current_last = 0.0f;
++
++    // ★ Subcontrol: 通用控制分配矩阵 + 推进器配置参数
++    ControlAllocationMatrix _ca_matrix;
++    bool _use_control_alloc;
++
++    // 推进器位置参数 (NED坐标系, 米)
++    AP_Float _thr_pos_x[AP_MOTORS_MAX_NUM_MOTORS];
++    AP_Float _thr_pos_y[AP_MOTORS_MAX_NUM_MOTORS];
++    AP_Float _thr_pos_z[AP_MOTORS_MAX_NUM_MOTORS];
++
++    // 推进器方向参数 (单位向量, 自动归一化)
++    AP_Float _thr_dir_x[AP_MOTORS_MAX_NUM_MOTORS];
++    AP_Float _thr_dir_y[AP_MOTORS_MAX_NUM_MOTORS];
++    AP_Float _thr_dir_z[AP_MOTORS_MAX_NUM_MOTORS];
++
++    // 推力限制 (牛顿)
++    AP_Float _thr_fmax[AP_MOTORS_MAX_NUM_MOTORS];
++    AP_Float _thr_fmin[AP_MOTORS_MAX_NUM_MOTORS];
++
++    // 每推进器推力曲线指数 γ (按型号标定; 0=用全局 CA_THRUST_CURVE)
++    AP_Float _thr_curve[AP_MOTORS_MAX_NUM_MOTORS];      // 正向 γ
++    AP_Float _thr_rev_curve[AP_MOTORS_MAX_NUM_MOTORS];  // 反向 γ
++
++    // 重心偏移 (NED, 米)
++    AP_Float _ca_cg_x;
++    AP_Float _ca_cg_y;
++    AP_Float _ca_cg_z;
++
++    // 活跃推进器数量
++    AP_Int8  _ca_n_thrusters;
++
++    // 推力曲线指数 (γ): throttle = sign(u)·(|u|/F_max)^(1/γ)
++    // 用于补偿"转速→推力"的非线性 (系柱工况 T ∝ n² → 默认 γ=2)
++    // 正向/反向可分别标定 (正反转桨推力系数通常不同)
++    AP_Float _ca_thrust_curve;    // 正向推力曲线指数 (默认 2.0)
++    AP_Float _ca_reverse_curve;   // 反向推力曲线指数 (默认 2.0)
+ };
+diff --git a/libraries/AP_Motors/AP_Motors_ControlAlloc.cpp b/libraries/AP_Motors/AP_Motors_ControlAlloc.cpp
+new file mode 100644
+index 0000000..706c20a
+--- /dev/null
++++ b/libraries/AP_Motors/AP_Motors_ControlAlloc.cpp
+@@ -0,0 +1,455 @@
++/// @file   AP_Motors_ControlAlloc.cpp
++/// @brief  通用控制分配矩阵实现 (C++ 移植自 Python control_allocation.py)
++///
++/// 本模块将原 Python 控制分配系统完整移植为 ArduPilot C++ 库。
++/// 核心算法: Moore-Penrose 伪逆 + Tikhonov 正则化 + RPI 饱和处理
++
++#include "AP_Motors_ControlAlloc.h"
++#include <AP_HAL/AP_HAL.h>
++#include <string.h>
++
++extern const AP_HAL::HAL& hal;
++
++// ============================================================================
++// 构造/初始化
++// ============================================================================
++
++ControlAllocationMatrix::ControlAllocationMatrix()
++    : _n_thrusters(0), _initialized(false)
++{
++    memset(_B, 0, sizeof(_B));
++    memset(_B_pinv, 0, sizeof(_B_pinv));
++    memset(_last_output, 0, sizeof(_last_output));
++    memset(_last_tau, 0, sizeof(_last_tau));
++}
++
++void ControlAllocationMatrix::init(const ThrusterConfig *thrusters,
++                                    uint8_t n, const Vector3f &cg)
++{
++    if (n > CA_MAX_THRUSTERS) n = CA_MAX_THRUSTERS;
++    _n_thrusters = n;
++    _cg = cg;
++
++    // 复制推进器配置并归一化方向向量
++    for (uint8_t i = 0; i < n; i++) {
++        _thrusters[i] = thrusters[i];
++        float len = _thrusters[i].direction.length();
++        if (len > 0.0f) {
++            _thrusters[i].direction /= len;
++        }
++    }
++
++    build_B_matrix();
++    compute_pinv();
++    _initialized = true;
++}
++
++// ============================================================================
++// B 矩阵构建 (对应 Python: _build_matrix)
++// ============================================================================
++
++void ControlAllocationMatrix::build_B_matrix()
++{
++    memset(_B, 0, sizeof(_B));
++
++    for (uint8_t i = 0; i < _n_thrusters; i++) {
++        // 力臂 = position - cg
++        Vector3f r = _thrusters[i].position - _cg;
++
++        // 有效方向 (考虑反向标志)
++        Vector3f d = _thrusters[i].direction;
++        if (_thrusters[i].reverse) {
++            d = -d;
++        }
++
++        // 力贡献 (前三行)
++        _B[0][i] = d.x;
++        _B[1][i] = d.y;
++        _B[2][i] = d.z;
++
++        // 力矩贡献 (后三行) = r × d
++        Vector3f torque = r % d;  // ArduPilot cross product operator
++        _B[3][i] = torque.x;
++        _B[4][i] = torque.y;
++        _B[5][i] = torque.z;
++    }
++}
++
++// ============================================================================
++// 矩阵运算
++// ============================================================================
++
++void ControlAllocationMatrix::mat_mul_6xN_Nx6(
++    const float A[CA_DOF][CA_MAX_THRUSTERS],
++    const float B[CA_MAX_THRUSTERS][CA_DOF],
++    float C[CA_DOF][CA_DOF], int N)
++{
++    memset(C, 0, sizeof(float) * CA_DOF * CA_DOF);
++    for (int i = 0; i < CA_DOF; i++) {
++        for (int j = 0; j < CA_DOF; j++) {
++            float sum = 0.0f;
++            for (int k = 0; k < N; k++) {
++                sum += A[i][k] * B[k][j];
++            }
++            C[i][j] = sum;
++        }
++    }
++}
++
++void ControlAllocationMatrix::mat_mul_Nx6_6x1(
++    const float A[CA_MAX_THRUSTERS][CA_DOF],
++    const float b[CA_DOF],
++    float c[], int N)
++{
++    for (int i = 0; i < N; i++) {
++        float sum = 0.0f;
++        for (int j = 0; j < CA_DOF; j++) {
++            sum += A[i][j] * b[j];
++        }
++        c[i] = sum;
++    }
++}
++
++void ControlAllocationMatrix::mat_transpose_6xN(
++    const float A[CA_DOF][CA_MAX_THRUSTERS],
++    float AT[CA_MAX_THRUSTERS][CA_DOF], int N)
++{
++    for (int i = 0; i < CA_DOF; i++) {
++        for (int j = 0; j < N; j++) {
++            AT[j][i] = A[i][j];
++        }
++    }
++}
++
++// ============================================================================
++// Cholesky 分解 + 6x6 对称正定矩阵求逆
++// ============================================================================
++
++int ControlAllocationMatrix::mat_inv_6x6_cholesky(
++    const float A[CA_DOF][CA_DOF],
++    float A_inv[CA_DOF][CA_DOF])
++{
++    float L[CA_DOF][CA_DOF];
++    memset(L, 0, sizeof(L));
++
++    // Cholesky: A = L * L^T
++    for (int j = 0; j < CA_DOF; j++) {
++        float diag = A[j][j];
++        for (int k = 0; k < j; k++) {
++            diag -= L[j][k] * L[j][k];
++        }
++        if (diag <= 1e-7f) {
++            // 非正定，正则化后重试
++            float A_reg[CA_DOF][CA_DOF];
++            memcpy(A_reg, A, sizeof(A_reg));
++            for (int i = 0; i < CA_DOF; i++) {
++                A_reg[i][i] += CA_REG_LAMBDA;
++            }
++            memset(L, 0, sizeof(L));
++            for (int jj = 0; jj < CA_DOF; jj++) {
++                float d = A_reg[jj][jj];
++                for (int k = 0; k < jj; k++) {
++                    d -= L[jj][k] * L[jj][k];
++                }
++                if (d <= 1e-7f) {
++                    // 仍然奇异，返回单位矩阵
++                    memset(A_inv, 0, sizeof(float) * CA_DOF * CA_DOF);
++                    for (int ii = 0; ii < CA_DOF; ii++) A_inv[ii][ii] = 1.0f;
++                    return -1;
++                }
++                L[jj][jj] = sqrtf(d);
++                for (int ii = jj + 1; ii < CA_DOF; ii++) {
++                    float off = A_reg[ii][jj];
++                    for (int k = 0; k < jj; k++) off -= L[ii][k] * L[jj][k];
++                    L[ii][jj] = off / L[jj][jj];
++                }
++            }
++            break;
++        }
++        L[j][j] = sqrtf(diag);
++        for (int i = j + 1; i < CA_DOF; i++) {
++            float off = A[i][j];
++            for (int k = 0; k < j; k++) off -= L[i][k] * L[j][k];
++            L[i][j] = off / L[j][j];
++        }
++    }
++
++    // 对单位阵的每一列求解 A_inv
++    // 前向代入: L * Y = I
++    float Y[CA_DOF][CA_DOF];
++    memset(Y, 0, sizeof(Y));
++    for (int col = 0; col < CA_DOF; col++) {
++        for (int i = 0; i < CA_DOF; i++) {
++            float sum = (i == col) ? 1.0f : 0.0f;
++            for (int j = 0; j < i; j++) sum -= L[i][j] * Y[j][col];
++            Y[i][col] = sum / L[i][i];
++        }
++    }
++
++    // 回代: L^T * A_inv = Y
++    memset(A_inv, 0, sizeof(float) * CA_DOF * CA_DOF);
++    for (int col = 0; col < CA_DOF; col++) {
++        for (int i = CA_DOF - 1; i >= 0; i--) {
++            float sum = Y[i][col];
++            for (int j = i + 1; j < CA_DOF; j++) {
++                sum -= L[j][i] * A_inv[j][col];
++            }
++            A_inv[i][col] = sum / L[i][i];
++        }
++    }
++
++    return 0;
++}
++
++// ============================================================================
++// 伪逆计算
++// ============================================================================
++
++float ControlAllocationMatrix::compute_pinv()
++{
++    memset(_B_pinv, 0, sizeof(_B_pinv));
++    if (_n_thrusters == 0) return 0.0f;
++
++    // B^T (Nx6)
++    float BT[CA_MAX_THRUSTERS][CA_DOF];
++    mat_transpose_6xN(_B, BT, _n_thrusters);
++
++    // S = B * B^T (6x6)
++    float S[CA_DOF][CA_DOF];
++    mat_mul_6xN_Nx6(_B, BT, S, _n_thrusters);
++
++    // S_inv
++    float S_inv[CA_DOF][CA_DOF];
++    mat_inv_6x6_cholesky(S, S_inv);
++
++    // B_pinv = B^T * S_inv (Nx6)
++    for (int i = 0; i < _n_thrusters; i++) {
++        for (int j = 0; j < CA_DOF; j++) {
++            float sum = 0.0f;
++            for (int k = 0; k < CA_DOF; k++) {
++                sum += BT[i][k] * S_inv[k][j];
++            }
++            _B_pinv[i][j] = sum;
++        }
++    }
++
++    // 返回 Cholesky 对角线最小值 (对诊断有用)
++    return 1.0f;  // placeholder
++}
++
++// ============================================================================
++// 饱和处理 (对应 Python: _handle_saturation)
++// ============================================================================
++
++void ControlAllocationMatrix::handle_saturation(float u[], uint8_t n)
++{
++    // 一等比缩放
++    float scale = 1.0f;
++    for (uint8_t i = 0; i < n; i++) {
++        if (u[i] > _thrusters[i].max_force) {
++            float s = _thrusters[i].max_force / u[i];
++            if (s < scale) scale = s;
++        } else if (u[i] < _thrusters[i].min_force) {
++            float s = _thrusters[i].min_force / u[i];
++            if (s < scale) scale = s;
++        }
++    }
++
++    if (scale < 1.0f) {
++        for (uint8_t i = 0; i < n; i++) u[i] *= scale;
++    }
++
++    // 二逐推进器裁剪
++    for (uint8_t i = 0; i < n; i++) {
++        if (u[i] > _thrusters[i].max_force) u[i] = _thrusters[i].max_force;
++        if (u[i] < _thrusters[i].min_force) u[i] = _thrusters[i].min_force;
++    }
++}
++
++// ============================================================================
++// 标准伪逆分配
++// ============================================================================
++
++void ControlAllocationMatrix::allocate_pinv(const float tau[CA_DOF], float u_out[])
++{
++    mat_mul_Nx6_6x1(_B_pinv, tau, u_out, _n_thrusters);
++    handle_saturation(u_out, _n_thrusters);
++}
++
++// ============================================================================
++// 再分配伪逆法 (RPI) (对应 Python: _rpi_allocate)
++// ============================================================================
++
++void ControlAllocationMatrix::allocate_rpi(const float tau[CA_DOF],
++                                            float u_out[], uint8_t max_iter)
++{
++    // 初始分配
++    mat_mul_Nx6_6x1(_B_pinv, tau, u_out, _n_thrusters);
++
++    bool saturated[CA_MAX_THRUSTERS];
++    memset(saturated, 0, sizeof(saturated));
++
++    for (uint8_t iter = 0; iter < max_iter; iter++) {
++        // 检查新饱和
++        bool new_sat = false;
++        for (uint8_t i = 0; i < _n_thrusters; i++) {
++            if (saturated[i]) continue;
++            if (u_out[i] > _thrusters[i].max_force) {
++                u_out[i] = _thrusters[i].max_force;
++                saturated[i] = true; new_sat = true;
++            } else if (u_out[i] < _thrusters[i].min_force) {
++                u_out[i] = _thrusters[i].min_force;
++                saturated[i] = true; new_sat = true;
++            }
++        }
++
++        if (!new_sat) break;  // 收敛
++
++        // 统计未饱和推进器
++        uint8_t free_idx[CA_MAX_THRUSTERS];
++        uint8_t n_free = 0;
++        for (uint8_t i = 0; i < _n_thrusters; i++) {
++            if (!saturated[i]) free_idx[n_free++] = i;
++        }
++        if (n_free == 0) break;  // 全部饱和
++
++        // 计算饱和推进器贡献
++        float tau_sat[CA_DOF];
++        memset(tau_sat, 0, sizeof(tau_sat));
++        for (uint8_t i = 0; i < _n_thrusters; i++) {
++            if (!saturated[i]) continue;
++            for (uint8_t j = 0; j < CA_DOF; j++) {
++                tau_sat[j] += _B[j][i] * u_out[i];
++            }
++        }
++
++        // 残余 tau
++        float tau_rem[CA_DOF];
++        for (uint8_t j = 0; j < CA_DOF; j++) {
++            tau_rem[j] = tau[j] - tau_sat[j];
++        }
++
++        // 缩减的 B 矩阵 (仅未饱和列)
++        float B_red[CA_DOF][CA_MAX_THRUSTERS];
++        memset(B_red, 0, sizeof(B_red));
++        for (uint8_t k = 0; k < n_free; k++) {
++            uint8_t idx = free_idx[k];
++            for (uint8_t j = 0; j < CA_DOF; j++) B_red[j][k] = _B[j][idx];
++        }
++
++        // 缩减的 B^T
++        float B_red_T[CA_MAX_THRUSTERS][CA_DOF];
++        mat_transpose_6xN(B_red, B_red_T, n_free);
++
++        // 缩减的 S = B_red * B_red^T
++        float S_red[CA_DOF][CA_DOF];
++        mat_mul_6xN_Nx6(B_red, B_red_T, S_red, n_free);
++
++        // 缩减的伪逆
++        float S_red_inv[CA_DOF][CA_DOF];
++        mat_inv_6x6_cholesky(S_red, S_red_inv);
++
++        float B_red_pinv[CA_MAX_THRUSTERS][CA_DOF];
++        memset(B_red_pinv, 0, sizeof(B_red_pinv));
++        for (int i = 0; i < n_free; i++) {
++            for (int j = 0; j < CA_DOF; j++) {
++                float sum = 0.0f;
++                for (int k = 0; k < CA_DOF; k++) {
++                    sum += B_red_T[i][k] * S_red_inv[k][j];
++                }
++                B_red_pinv[i][j] = sum;
++            }
++        }
++
++        // 对未饱和推进器重新分配
++        mat_mul_Nx6_6x1(B_red_pinv, tau_rem, u_out, n_free);
++
++        // 写回 (注意索引映射)
++        float u_free_vals[CA_MAX_THRUSTERS];
++        memcpy(u_free_vals, u_out, sizeof(float) * n_free);
++        for (uint8_t k = 0; k < n_free; k++) {
++            u_out[free_idx[k]] = u_free_vals[k];
++        }
++    }
++
++    // 最终裁剪
++    handle_saturation(u_out, _n_thrusters);
++}
++
++// ============================================================================
++// 公共 API
++// ============================================================================
++
++void ControlAllocationMatrix::allocate(const float tau[CA_DOF],
++                                        float u_out[], uint8_t method)
++{
++    if (!_initialized) return;
++    memcpy(_last_tau, tau, sizeof(float) * CA_DOF);
++    _last_method = method;
++
++    if (method == 1) {
++        allocate_rpi(tau, u_out);
++    } else {
++        allocate_pinv(tau, u_out);
++    }
++    memcpy(_last_output, u_out, sizeof(float) * _n_thrusters);
++}
++
++void ControlAllocationMatrix::allocate_dof(float surge, float sway, float heave,
++                                            float roll, float pitch, float yaw,
++                                            float u_out[])
++{
++    float tau[CA_DOF] = {surge, sway, heave, roll, pitch, yaw};
++    allocate(tau, u_out, 1);  // 默认 RPI
++}
++
++void ControlAllocationMatrix::diagnose(ControlAllocDiagnosis &result)
++{
++    memset(&result, 0, sizeof(result));
++    if (!_initialized) { result.is_singular = 1; return; }
++
++    // 秩估计 (通过 Cholesky 分解)
++    float BT[CA_MAX_THRUSTERS][CA_DOF];
++    mat_transpose_6xN(_B, BT, _n_thrusters);
++    float S[CA_DOF][CA_DOF];
++    mat_mul_6xN_Nx6(_B, BT, S, _n_thrusters);
++
++    float L[CA_DOF][CA_DOF];
++    memset(L, 0, sizeof(L));
++    result.rank = 0;
++    for (int j = 0; j < CA_DOF; j++) {
++        float d = S[j][j];
++        for (int k = 0; k < j; k++) d -= L[j][k] * L[j][k];
++        if (d > 1e-7f) {
++            L[j][j] = sqrtf(d);
++            result.rank++;
++            for (int i = j+1; i < CA_DOF; i++) {
++                float off = S[i][j];
++                for (int k = 0; k < j; k++) off -= L[i][k] * L[j][k];
++                L[i][j] = off / L[j][j];
++            }
++        }
++    }
++
++    // Frobenius 范数
++    float fb = 0, fbp = 0;
++    for (int i = 0; i < CA_DOF; i++)
++        for (int j = 0; j < _n_thrusters; j++)
++            fb += _B[i][j] * _B[i][j];
++    for (int i = 0; i < _n_thrusters; i++)
++        for (int j = 0; j < CA_DOF; j++)
++            fbp += _B_pinv[i][j] * _B_pinv[i][j];
++    result.frob_norm_B = sqrtf(fb);
++    result.frob_norm_B_pinv = sqrtf(fbp);
++    result.condition_number = result.frob_norm_B * result.frob_norm_B_pinv;
++    result.is_singular = (result.condition_number > 1e8f) ? 1 : 0;
++    result.quality_score = 100 - (6 - result.rank) * 20;
++    if (result.condition_number > 10) result.quality_score -= 10;
++    if (result.quality_score < 0) result.quality_score = 0;
++}
++
++void ControlAllocationMatrix::update_thrusters(const ThrusterConfig *thrusters,
++                                                uint8_t n)
++{
++    init(thrusters, n, _cg);
++}
+diff --git a/libraries/AP_Motors/AP_Motors_ControlAlloc.h b/libraries/AP_Motors/AP_Motors_ControlAlloc.h
+new file mode 100644
+index 0000000..76c159b
+--- /dev/null
++++ b/libraries/AP_Motors/AP_Motors_ControlAlloc.h
+@@ -0,0 +1,114 @@
++/// @file   AP_Motors_ControlAlloc.h
++/// @brief  通用控制分配矩阵 (替代硬编码推进器映射)
++///         General Control Allocation Matrix (replaces hardcoded thruster mapping)
++///
++/// 本模块提供基于 Moore-Penrose 伪逆的任意推进器布局控制分配。
++/// 对标 Python 版 control_allocation.py 的核心功能。
++///
++/// 使用方法:
++///   1. 通过 QGC 参数 MOT_n_* 配置每个推进器的位置/方向/推力
++///   2. ControlAllocationMatrix 自动构建 6xN 矩阵 B 并计算伪逆 B+
++///   3. 控制循环中调用 allocate(tau, u_out) 获得各推进器推力
++
++#pragma once
++
++#include <AP_Common/AP_Common.h>
++#include <AP_Math/AP_Math.h>
++
++#define CA_MAX_THRUSTERS    16      // 最大推进器数量
++#define CA_DOF              6       // 自由度 (固定为6)
++#define CA_REG_LAMBDA       1e-6f   // Tikhonov 正则化参数
++
++// ---- 推进器配置 (对应 Python ThrusterConfig) ----
++struct ThrusterConfig {
++    char    name[32];
++    Vector3f position;      // 安装位置 (m, NED)
++    Vector3f direction;     // 推力方向 (自动归一化)
++    float   max_force;      // 正向最大推力 (N)
++    float   min_force;      // 反向最大推力 (N)
++    int8_t  reverse;        // 反向标志
++    char    group[16];
++    float   thrust_curve;   // 正向推力曲线指数 γ (默认2.0=√补偿)
++    float   reverse_curve;  // 反向推力曲线指数 γ (默认2.0)
++};
++
++// ---- 诊断信息 (对应 Python ca_diagnosis_t) ----
++struct ControlAllocDiagnosis {
++    int     rank;
++    float   condition_number;
++    float   singular_values[CA_DOF];
++    int     is_singular;
++    float   frob_norm_B;
++    float   frob_norm_B_pinv;
++    int     n_saturated;
++    float   allocation_error_norm;
++    int     quality_score;          // 0-100
++};
++
++// ---- 控制分配矩阵主类 (对应 Python ControlAllocationMatrix) ----
++class ControlAllocationMatrix {
++public:
++    ControlAllocationMatrix();
++
++    // 初始化: 传入推进器配置数组和重心位置
++    void init(const ThrusterConfig *thrusters, uint8_t n, const Vector3f &cg);
++
++    // 核心: 将 tau 分配到各推进器
++    // method: 0 = 伪逆+等比缩放, 1 = 再分配伪逆(RPI)
++    void allocate(const float tau[CA_DOF], float u_out[], uint8_t method = 0);
++
++    // 便捷: 按独立自由度分配
++    void allocate_dof(float surge, float sway, float heave,
++                      float roll, float pitch, float yaw,
++                      float u_out[]);
++
++    // 诊断
++    void diagnose(ControlAllocDiagnosis &result);
++
++    // 获取分配矩阵信息 (用于调试)
++    void get_matrix_info(char *buf, uint16_t buf_len);
++
++    // 更新推进器配置 (运行时)
++    void update_thrusters(const ThrusterConfig *thrusters, uint8_t n);
++
++    // 获取上次分配结果
++    const float* get_last_output() const { return _last_output; }
++    uint8_t get_num_thrusters() const { return _n_thrusters; }
++
++private:
++    uint8_t _n_thrusters;
++    Vector3f _cg;
++    ThrusterConfig _thrusters[CA_MAX_THRUSTERS];
++
++    // 控制分配矩阵 B (6xN) 及其伪逆 B+ (Nx6)
++    float _B[CA_DOF][CA_MAX_THRUSTERS];
++    float _B_pinv[CA_MAX_THRUSTERS][CA_DOF];
++
++    // 上次分配结果
++    float _last_output[CA_MAX_THRUSTERS];
++    float _last_tau[CA_DOF];
++    uint8_t _last_method;
++
++    bool _initialized;
++
++    // ---- 内部方法 ----
++    void build_B_matrix();
++    float compute_pinv();
++    void allocate_pinv(const float tau[CA_DOF], float u_out[]);
++    void allocate_rpi(const float tau[CA_DOF], float u_out[], uint8_t max_iter = 20);
++
++    // ---- 矩阵运算 ----
++    static void mat_mul_6xN_Nx6(const float A[CA_DOF][CA_MAX_THRUSTERS],
++                                const float B[CA_MAX_THRUSTERS][CA_DOF],
++                                float C[CA_DOF][CA_DOF], int N);
++    static void mat_mul_Nx6_6x1(const float A[CA_MAX_THRUSTERS][CA_DOF],
++                                const float b[CA_DOF],
++                                float c[], int N);
++    static void mat_transpose_6xN(const float A[CA_DOF][CA_MAX_THRUSTERS],
++                                  float AT[CA_MAX_THRUSTERS][CA_DOF], int N);
++    static int  mat_inv_6x6_cholesky(const float A[CA_DOF][CA_DOF],
++                                     float A_inv[CA_DOF][CA_DOF]);
++
++    // ---- 饱和处理 ----
++    void handle_saturation(float u[], uint8_t n);
++};

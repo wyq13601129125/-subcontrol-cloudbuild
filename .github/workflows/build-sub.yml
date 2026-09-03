@@ -1,0 +1,67 @@
+# Build ArduSub (Subcontrol patch) for mRoControlZeroClassic  via GitHub Actions
+# 云编译: 拉取与本地快照同源的上游 ArduPilot@cad79ca → 打 subcontrol.patch → ./waf sub
+name: Build ArduSub (Subcontrol)
+
+on:
+  workflow_dispatch:                # 可在 Actions 页手动重跑
+  push:                             # push 到任意分支自动触发
+
+jobs:
+  build-sub:
+    runs-on: ubuntu-22.04
+    # 官方 ChibiOS 编译容器(自带 ARM 交叉工具链 /opt/gcc-arm-none-eabi-*)
+    container: ardupilot/ardupilot-dev-chibios:v0.2.0
+    timeout-minutes: 120
+    steps:
+      # 1) 检出本仓库 —— 只有 workflow + 补丁, 很小
+      - name: Checkout repo (workflow + patch)
+        uses: actions/checkout@v4
+
+      # 2) 拉取上游源码并固定到快照版本 cad79ca (完整 SHA, 含子模块)
+      - name: Fetch upstream ArduPilot @ cad79ca
+        run: |
+          set -ex
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git init -q ardupilot
+          cd ardupilot
+          git remote add origin https://github.com/ArduPilot/ardupilot.git
+          # 单提交浅拉, 避免整仓历史
+          git fetch --depth 1 origin cad79ca723021f326b48d916f89b4a932c5d8cf0
+          git checkout -q -b subcontrol-build FETCH_HEAD
+          # 子模块(ChibiOS/mavlink/...): 先浅拉, 失败则全量补齐
+          git submodule update --init --recursive --depth 1 \
+            || git submodule update --init --recursive
+
+      # 3) 打 Subcontrol 补丁
+      - name: Apply subcontrol.patch
+        run: |
+          set -ex
+          cd ardupilot
+          git apply --verbose "${GITHUB_WORKSPACE}/subcontrol.patch"
+          echo "--- 确认改动落位 ---"
+          ls libraries/AP_Motors/AP_Motors_ControlAlloc.*
+          grep -c "CA_THRUST_CURVE" libraries/AP_Motors/AP_Motors6DOF.cpp || true
+
+      # 4) 编译 ArduSub 固件 (mRoControlZeroClassic = STM32H743ZIT6, 与自研板同芯片)
+      - name: Build ./waf sub
+        run: |
+          set -ex
+          # 容器内 ARM 工具链发现(官方路径 /opt/gcc-arm-none-eabi-10/bin)
+          export PATH="/usr/lib/ccache:${PATH}"
+          GCCDIR="$(ls -d /opt/gcc-arm-none-eabi-*/bin 2>/dev/null | head -1)"
+          [ -n "${GCCDIR}" ] && export PATH="${GCCDIR}:${PATH}"
+          command -v arm-none-eabi-gcc || { echo "ARM toolchain missing!"; ls -R /opt 2>/dev/null | head -40; exit 1; }
+          arm-none-eabi-gcc --version | head -1
+          cd ardupilot
+          python3 --version
+          ./waf configure --board mRoControlZeroClassic
+          ./waf sub
+          ls -la build/mRoControlZeroClassic/bin/
+
+      # 5) 上传固件产物
+      - name: Upload firmware (.apj)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardisub-mRoControlZeroClassic
+          path: ardupilot/build/mRoControlZeroClassic/bin/ardusub.apj
+          if-no-files-found: error

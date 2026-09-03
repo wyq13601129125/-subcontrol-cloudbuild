@@ -1,0 +1,4 @@
+# 保证补丁/workflow 以 LF 提交, 避免 Windows 换行(CRLF)污染
+*.patch text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
